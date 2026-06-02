@@ -1,2 +1,387 @@
 # hermes_flow.py
 projeto de otimização  
+# ==============================================================================
+# HERMES FLOW v3.1
+# ==============================================================================
+!pip install pulp folium pandas requests networkx sympy -q
+
+import pulp, folium, math, requests
+import pandas as pd
+import numpy as np
+import networkx as nx
+import sympy as sp
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from math import factorial, comb
+from IPython.display import display, HTML
+
+# ---------------- 1. DADOS ----------------
+pontos = {
+    'BASE':      {'lat': -23.5500, 'lon': -46.6333, 'peso': 0},
+    'DESTINO':   {'lat': -23.5600, 'lon': -46.6500, 'peso': 0},
+    'Entrega_A': {'lat': -23.5420, 'lon': -46.6200, 'peso': 15},
+    'Entrega_B': {'lat': -23.5300, 'lon': -46.6600, 'peso': 120},
+    'Entrega_C': {'lat': -23.5700, 'lon': -46.6450, 'peso': 8},
+    'Entrega_D': {'lat': -23.5550, 'lon': -46.6100, 'peso': 40}
+}
+capacidades = {
+    'MOTO': {'peso': 20,  'cor': 'red',  'custo_km': 1.2, 'custo_fixo': 5.0,
+             'tarifa_entrega': 12.0, 'tarifa_kg': 2.5},
+    'VAN':  {'peso': 200, 'cor': 'blue', 'custo_km': 3.5, 'custo_fixo': 15.0,
+             'tarifa_entrega': 25.0, 'tarifa_kg': 1.8}
+}
+META_MARGEM = 30.0  # %
+
+# ---------------- HAVERSINE ----------------
+def calcular_dist(p1, p2):
+    R = 6371
+    lat1, lon1 = math.radians(p1['lat']), math.radians(p1['lon'])
+    lat2, lon2 = math.radians(p2['lat']), math.radians(p2['lon'])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+# ---------------- 1.5 ÁLGEBRA LINEAR ----------------
+nomes = list(pontos.keys())
+N = len(nomes)
+D = np.zeros((N, N))
+for i, ni in enumerate(nomes):
+    for j, nj in enumerate(nomes):
+        if i != j:
+            D[i, j] = calcular_dist(pontos[ni], pontos[nj])
+print("📐 Matriz de Distâncias D (km):")
+display(pd.DataFrame(D, index=nomes, columns=nomes).round(2))
+w = np.array([pontos[n]['peso'] for n in nomes])
+print(f"⚖️ Vetor de pesos w = {w}")
+print(f"📦 L1 (carga total): {np.linalg.norm(w,1)} kg | L2: {np.linalg.norm(w,2):.2f}")
+print(f"🔢 det(D[1:,1:]): {np.linalg.det(D[1:,1:]):.3f}")
+
+# ---------------- 1.6 COMBINATÓRIA ----------------
+clientes_lista = [n for n in pontos if n not in ['BASE','DESTINO']]
+print(f"\n🔢 Clientes: {len(clientes_lista)} | Permutações: {factorial(len(clientes_lista)):,}")
+print(f"   Pares cliente-veículo: {comb(len(clientes_lista),2)*len(capacidades)}")
+
+# ---------------- 2. MILP ----------------
+def resolver_milp(pontos_in, capacidades_in, forcar_uso=True, msg=0):
+    clientes   = [n for n in pontos_in if n not in ['BASE','DESTINO']]
+    nos_totais = list(pontos_in.keys())
+    modais     = list(capacidades_in.keys())
+    n          = len(nos_totais)
+    prob = pulp.LpProblem("Hermes_Flow_VRP", pulp.LpMinimize)
+    x = pulp.LpVariable.dicts("rota",
+        [(i,j,v) for i in nos_totais for j in nos_totais for v in modais if i!=j],
+        cat='Binary')
+    y = pulp.LpVariable.dicts("uso", modais, cat='Binary')
+    u = pulp.LpVariable.dicts("ordem",
+        [(i,v) for i in nos_totais for v in modais],
+        lowBound=0, upBound=n, cat='Continuous')
+
+    prob += (pulp.lpSum([capacidades_in[v]['custo_fixo']*y[v] for v in modais]) +
+             pulp.lpSum([calcular_dist(pontos_in[i],pontos_in[j]) *
+                         capacidades_in[v]['custo_km'] * x[i,j,v]
+                         for i in nos_totais for j in nos_totais for v in modais if i!=j]))
+
+    for c in clientes:
+        prob += pulp.lpSum([x[i,c,v] for i in nos_totais for v in modais if i!=c]) == 1
+        prob += pulp.lpSum([x[c,j,v] for j in nos_totais for v in modais if j!=c]) == 1
+    for c in clientes:
+        for v in modais:
+            prob += (pulp.lpSum([x[i,c,v] for i in nos_totais if i!=c]) ==
+                     pulp.lpSum([x[c,j,v] for j in nos_totais if j!=c]))
+    for v in modais:
+        prob += pulp.lpSum([x['BASE',j,v] for j in nos_totais if j!='BASE']) == y[v]
+        prob += pulp.lpSum([x[i,'DESTINO',v] for i in nos_totais if i!='DESTINO']) == y[v]
+        prob += pulp.lpSum([x['DESTINO',j,v] for j in nos_totais if j!='DESTINO']) == 0
+        prob += pulp.lpSum([x[i,'BASE',v] for i in nos_totais if i!='BASE']) == 0
+        prob += pulp.lpSum([pontos_in[c]['peso']*x[i,c,v]
+                            for c in clientes for i in nos_totais if i!=c]) <= capacidades_in[v]['peso']*y[v]
+    if forcar_uso:
+        for v in modais:
+            prob += y[v] == 1
+            prob += pulp.lpSum([x[i,c,v] for c in clientes for i in nos_totais if i!=c]) >= 1
+    for v in modais:
+        for i in nos_totais:
+            for j in nos_totais:
+                if i!=j and i!='BASE' and j!='BASE' and j!='DESTINO':
+                    prob += u[(i,v)] - u[(j,v)] + n*x[i,j,v] <= n-1
+    prob.solve(pulp.PULP_CBC_CMD(msg=msg))
+    return prob, x, y, u, pulp.LpStatus[prob.status], pulp.value(prob.objective)
+
+# ---------------- 2.1 RECEITA / LUCRO / MARGEM ----------------
+def calcular_receita(pontos_in, capacidades_in, x_vars):
+    clientes_loc = [n for n in pontos_in if n not in ['BASE','DESTINO']]
+    nos_loc      = list(pontos_in.keys())
+    modais_loc   = list(capacidades_in.keys())
+    total = 0.0
+    por_modal = {m: 0.0 for m in modais_loc}
+    for v in modais_loc:
+        for c in clientes_loc:
+            for i in nos_loc:
+                if i!=c and pulp.value(x_vars[i,c,v]) is not None and pulp.value(x_vars[i,c,v])>=0.99:
+                    tarifa = capacidades_in[v]['tarifa_entrega'] + capacidades_in[v]['tarifa_kg']*pontos_in[c]['peso']
+                    por_modal[v] += tarifa
+                    total += tarifa
+                    break
+    return total, por_modal
+
+def calcular_margem(receita, custo):
+    if receita <= 0: return 0.0, 0.0
+    lucro = receita - custo
+    return lucro, (lucro/receita)*100
+
+prob, x, y, u, status, custo_total = resolver_milp(pontos, capacidades)
+clientes   = [n for n in pontos if n not in ['BASE','DESTINO']]
+nos_totais = list(pontos.keys())
+modais     = list(capacidades.keys())
+n          = len(nos_totais)
+receita_total, receita_modal = calcular_receita(pontos, capacidades, x)
+lucro_total, margem_pct = calcular_margem(receita_total, custo_total)
+status_meta = "✅ ACIMA DA META" if margem_pct >= META_MARGEM else "⚠️ ABAIXO DA META"
+print(f"\n📊 Status: {status}")
+print(f"💸 Custo:   R$ {custo_total:.2f}")
+print(f"💵 Receita: R$ {receita_total:.2f}")
+print(f"💰 Lucro:   R$ {lucro_total:.2f}")
+print(f"📈 Margem:  {margem_pct:.2f}%  (meta {META_MARGEM:.1f}%) — {status_meta}")
+
+# ---------------- 2.5 GRAFOS ----------------
+G = nx.DiGraph()
+for nome, p in pontos.items():
+    G.add_node(nome, pos=(p['lon'], p['lat']))
+for v in modais:
+    for i in nos_totais:
+        for j in nos_totais:
+            if i!=j and pulp.value(x[i,j,v]) is not None and pulp.value(x[i,j,v])>=0.99:
+                G.add_edge(i, j, modal=v, cor=capacidades[v]['cor'])
+pos = nx.get_node_attributes(G, 'pos')
+plt.figure(figsize=(10,7))
+nx.draw(G, pos, with_labels=True, node_color='lightyellow',
+        edge_color=[G[a][b]['cor'] for a,b in G.edges()],
+        node_size=1600, font_size=9, arrows=True, arrowsize=22,
+        width=2.2, edgecolors='black')
+plt.title("🕸️ Grafo Dirigido da Solução Ótima")
+plt.tight_layout(); plt.show()
+print(f"Vértices: {G.number_of_nodes()} | Arestas: {G.number_of_edges()}")
+
+# ---------------- 2.6 CÁLCULO ----------------
+np.random.seed(42)
+dias = np.arange(1, 31)
+demanda_hist = 150 + 3.5*dias + np.random.normal(0, 12, 30)
+def modelo_linear(x_, a, b): return a*x_ + b
+(a_fit, b_fit), _ = curve_fit(modelo_linear, dias, demanda_hist)
+t = sp.Symbol('t')
+f_sym = a_fit*t + b_fit
+df_sym = sp.diff(f_sym, t)
+integral_sym = sp.integrate(f_sym, (t, 1, 30))
+demanda_acumulada = float(integral_sym)
+tarifa_media_kg = np.mean([capacidades[m]['tarifa_kg'] for m in modais])
+receita_proj_30d = demanda_acumulada * tarifa_media_kg
+lucro_proj_30d = receita_proj_30d * (margem_pct/100)
+print(f"\n📈 f(t) = {a_fit:.3f}t + {b_fit:.3f} | f'(t) = {df_sym}")
+print(f"   ∫f dt (1..30) = {demanda_acumulada:.2f} kg")
+print(f"   Receita projetada 30d: R$ {receita_proj_30d:,.2f}")
+print(f"   Lucro projetado 30d:   R$ {lucro_proj_30d:,.2f}")
+plt.figure(figsize=(10,4))
+plt.scatter(dias, demanda_hist, color='steelblue', label='Histórico')
+plt.plot(dias, modelo_linear(dias, a_fit, b_fit), 'r-', linewidth=2,
+         label=f'{a_fit:.2f}t + {b_fit:.2f}')
+plt.xlabel('Dia'); plt.ylabel('Demanda (kg)')
+plt.title('Regressão de Demanda'); plt.legend(); plt.grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+
+# ---------------- 2.7 MONTE CARLO ----------------
+N_SIM = 30
+print(f"\n🎲 Monte Carlo — {N_SIM} cenários...")
+custos_sim, receitas_sim, lucros_sim, margens_sim = [], [], [], []
+for k in range(N_SIM):
+    p_sim = {k_: dict(v_) for k_, v_ in pontos.items()}
+    c_sim = {k_: dict(v_) for k_, v_ in capacidades.items()}
+    for c in clientes:
+        p_sim[c]['peso'] = max(1, int(pontos[c]['peso']*np.random.normal(1, 0.2)))
+    for m in modais:
+        c_sim[m]['custo_km']       = max(0.1, capacidades[m]['custo_km']*np.random.normal(1, 0.15))
+        c_sim[m]['tarifa_kg']      = max(0.1, capacidades[m]['tarifa_kg']*np.random.normal(1, 0.10))
+        c_sim[m]['tarifa_entrega'] = max(0.1, capacidades[m]['tarifa_entrega']*np.random.normal(1, 0.10))
+    try:
+        _, x_s, _, _, st, c_obj = resolver_milp(p_sim, c_sim, True, 0)
+        if st=='Optimal' and c_obj is not None:
+            rec_s, _ = calcular_receita(p_sim, c_sim, x_s)
+            luc_s, mrg_s = calcular_margem(rec_s, c_obj)
+            custos_sim.append(c_obj); receitas_sim.append(rec_s)
+            lucros_sim.append(luc_s); margens_sim.append(mrg_s)
+    except Exception:
+        continue
+custos_sim = np.array(custos_sim); receitas_sim = np.array(receitas_sim)
+lucros_sim = np.array(lucros_sim); margens_sim = np.array(margens_sim)
+print(f"   Válidos: {len(custos_sim)}/{N_SIM}")
+print(f"   Custo médio:   R$ {custos_sim.mean():.2f} (σ R$ {custos_sim.std():.2f})")
+print(f"   Receita média: R$ {receitas_sim.mean():.2f} (σ R$ {receitas_sim.std():.2f})")
+print(f"   Lucro médio:   R$ {lucros_sim.mean():.2f} (σ R$ {lucros_sim.std():.2f})")
+print(f"   Margem média:  {margens_sim.mean():.2f}% (σ {margens_sim.std():.2f} pp)")
+print(f"   IC95 margem:   [{np.percentile(margens_sim,2.5):.2f}%, {np.percentile(margens_sim,97.5):.2f}%]")
+prob_meta = float((margens_sim>=META_MARGEM).mean()*100)
+print(f"   P(margem ≥ {META_MARGEM}%): {prob_meta:.1f}%")
+
+fig, axs = plt.subplots(1, 2, figsize=(14, 4))
+axs[0].hist(custos_sim, bins=15, color='steelblue', edgecolor='white')
+axs[0].axvline(custo_total, color='red', linestyle='--', label=f'Base R$ {custo_total:.2f}')
+axs[0].set_title('Distribuição de Custo'); axs[0].legend(); axs[0].grid(alpha=0.3)
+axs[1].hist(margens_sim, bins=15, color='seagreen', edgecolor='white')
+axs[1].axvline(margem_pct, color='red', linestyle='--', label=f'Base {margem_pct:.2f}%')
+axs[1].axvline(META_MARGEM, color='orange', linestyle=':', linewidth=2, label=f'Meta {META_MARGEM}%')
+axs[1].set_title('Distribuição da Margem'); axs[1].legend(); axs[1].grid(alpha=0.3)
+plt.tight_layout(); plt.show()
+
+# ---------------- 3. OSRM ----------------
+def rota_real(p1, p2):
+    try:
+        url = ("https://router.project-osrm.org/route/v1/driving/"
+               f"{p1['lon']},{p1['lat']};{p2['lon']},{p2['lat']}"
+               "?overview=full&geometries=geojson")
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            coords = r.json()['routes'][0]['geometry']['coordinates']
+            return [[lat, lon] for lon, lat in coords]
+    except Exception:
+        pass
+    return [[p1['lat'], p1['lon']], [p2['lat'], p2['lon']]]
+
+# ---------------- 4. MAPA + RELATÓRIO ----------------
+mapa = folium.Map(location=[-23.55, -46.6333], zoom_start=13, tiles='cartodbpositron')
+relatorio = []
+
+def custo_por_modal(modal):
+    c = capacidades[modal]['custo_fixo']
+    for i in nos_totais:
+        for j in nos_totais:
+            if i!=j and pulp.value(x[i,j,modal]) is not None and pulp.value(x[i,j,modal])>=0.99:
+                c += calcular_dist(pontos[i], pontos[j]) * capacidades[modal]['custo_km']
+    return c
+
+if status == 'Optimal':
+    for modal in modais:
+        sequencia = ['BASE']
+        carga = 0
+        atual = 'BASE'
+        seg = 0
+        while atual != 'DESTINO' and seg < n+2:
+            for prox in nos_totais:
+                if prox!=atual and pulp.value(x[atual,prox,modal]) is not None and pulp.value(x[atual,prox,modal])>=0.99:
+                    sequencia.append(prox)
+                    if prox in clientes: carga += pontos[prox]['peso']
+                    atual = prox; break
+            seg += 1
+        for idx in range(len(sequencia)-1):
+            p1 = pontos[sequencia[idx]]; p2 = pontos[sequencia[idx+1]]
+            folium.PolyLine(locations=rota_real(p1,p2),
+                color=capacidades[modal]['cor'], weight=6, opacity=0.8,
+                dash_array='10, 8' if modal=='MOTO' else None,
+                tooltip=f"{modal}: {sequencia[idx]} → {sequencia[idx+1]}").add_to(mapa)
+        for ordem, nome in enumerate(sequencia):
+            if nome in clientes:
+                p = pontos[nome]
+                div_html = ("<div style='background:" + capacidades[modal]['cor'] +
+                            ";color:white;border:2px solid white;border-radius:50%;"
+                            "width:32px;height:32px;text-align:center;line-height:28px;"
+                            "font-weight:bold;font-family:Arial;'>" + str(ordem) + "</div>")
+                folium.Marker([p['lat'], p['lon']],
+                    icon=folium.DivIcon(html=div_html),
+                    popup=f"Parada #{ordem} | {nome} | {modal} | {pontos[nome]['peso']} kg"
+                ).add_to(mapa)
+        rec_m = receita_modal[modal]
+        cst_m = custo_por_modal(modal)
+        luc_m = rec_m - cst_m
+        mrg_m = (luc_m/rec_m*100) if rec_m>0 else 0.0
+        relatorio.append({
+            'modal': modal, 'cor': capacidades[modal]['cor'],
+            'carga': carga, 'limite': capacidades[modal]['peso'],
+            'receita': round(rec_m,2), 'custo': round(cst_m,2),
+            'lucro': round(luc_m,2), 'margem_%': round(mrg_m,2),
+            'sequencia': " → ".join(sequencia)
+        })
+
+folium.Marker([pontos['BASE']['lat'], pontos['BASE']['lon']],
+              tooltip="🏭 Base",
+              icon=folium.Icon(color='green', icon='home', prefix='fa')).add_to(mapa)
+folium.Marker([pontos['DESTINO']['lat'], pontos['DESTINO']['lon']],
+              tooltip="🏁 Destino",
+              icon=folium.Icon(color='black', icon='flag', prefix='fa')).add_to(mapa)
+
+# ---------------- 5. DASHBOARD (HTML por partes curtas) ----------------
+cor_margem = "#2ecc71" if margem_pct >= META_MARGEM else "#e67e22"
+
+parts = []
+parts.append("<div style='background:#1e1e2f;color:white;padding:25px;border-radius:15px;font-family:Segoe UI,sans-serif;'>")
+parts.append("<h2 style='margin-top:0;border-bottom:2px solid #3d3d5c;padding-bottom:10px;'>")
+parts.append("🚚 Hermes Flow v3.1 — Otimização Multi-Modal + Margem de Lucro</h2>")
+
+# KPIs
+parts.append("<div style='display:flex;gap:15px;flex-wrap:wrap;margin:10px 0 20px;'>")
+parts.append("<div style='flex:1;min-width:160px;background:#2a2a40;padding:12px;border-radius:10px;'>")
+parts.append("<div style='font-size:12px;color:#aaa;'>CUSTO</div>")
+parts.append("<div style='font-size:20px;font-weight:bold;color:#ff7675;'>R$ {:.2f}</div></div>".format(custo_total))
+parts.append("<div style='flex:1;min-width:160px;background:#2a2a40;padding:12px;border-radius:10px;'>")
+parts.append("<div style='font-size:12px;color:#aaa;'>RECEITA</div>")
+parts.append("<div style='font-size:20px;font-weight:bold;color:#74b9ff;'>R$ {:.2f}</div></div>".format(receita_total))
+parts.append("<div style='flex:1;min-width:160px;background:#2a2a40;padding:12px;border-radius:10px;'>")
+parts.append("<div style='font-size:12px;color:#aaa;'>LUCRO</div>")
+parts.append("<div style='font-size:20px;font-weight:bold;color:#55efc4;'>R$ {:.2f}</div></div>".format(lucro_total))
+parts.append("<div style='flex:1;min-width:160px;background:#2a2a40;padding:12px;border-radius:10px;border:2px solid {0};'>".format(cor_margem))
+parts.append("<div style='font-size:12px;color:#aaa;'>MARGEM DE LUCRO</div>")
+parts.append("<div style='font-size:20px;font-weight:bold;color:{0};'>{1:.2f}%</div>".format(cor_margem, margem_pct))
+parts.append("<div style='font-size:11px;color:#aaa;'>Meta: {:.1f}%</div></div>".format(META_MARGEM))
+parts.append("</div>")  # fim KPIs
+
+# Linha de status
+parts.append("<p style='color:#bbb;font-size:13px;'>")
+parts.append("Status: {0} | Clientes: {1} | Frota: {2} | σ Custo MC: R$ {3:.2f} | Margem média MC: {4:.2f}% | P(meta): {5:.1f}%".format(
+    status, len(clientes), len(modais), custos_sim.std(), margens_sim.mean(), prob_meta))
+parts.append("</p>")
+
+# Cards por modal
+parts.append("<div style='display:flex;gap:15px;margin-top:20px;flex-wrap:wrap;'>")
+for r in relatorio:
+    pct = (r['carga']/r['limite'])*100 if r['limite']>0 else 0
+    cor_m = "#2ecc71" if r['margem_%'] >= META_MARGEM else "#e67e22"
+    parts.append("<div style='flex:1;min-width:280px;background:#2a2a40;padding:15px;border-radius:10px;border-left:8px solid {0};'>".format(r['cor']))
+    parts.append("<h3 style='margin:0;color:{0};'>{1}</h3>".format(r['cor'], r['modal']))
+    parts.append("<p style='font-size:14px;margin:10px 0;'>Carga: <b>{0} kg</b> / {1} kg</p>".format(r['carga'], r['limite']))
+    parts.append("<div style='width:100%;background:#3d3d5c;height:10px;border-radius:5px;'>")
+    parts.append("<div style='width:{0}%;background:{1};height:10px;border-radius:5px;'></div></div>".format(pct, r['cor']))
+    parts.append("<p style='font-size:11px;text-align:right;margin-top:5px;'>Ocupação: {:.1f}%</p>".format(pct))
+    parts.append("<table style='width:100%;font-size:12px;color:#ddd;margin-top:10px;border-collapse:collapse;'>")
+    parts.append("<tr><td>💵 Receita</td><td style='text-align:right;'><b>R$ {:.2f}</b></td></tr>".format(r['receita']))
+    parts.append("<tr><td>💸 Custo</td><td style='text-align:right;'><b>R$ {:.2f}</b></td></tr>".format(r['custo']))
+    parts.append("<tr><td>💰 Lucro</td><td style='text-align:right;'><b>R$ {:.2f}</b></td></tr>".format(r['lucro']))
+    parts.append("<tr><td>📈 Margem</td><td style='text-align:right;color:{0};'><b>{1:.2f}%</b></td></tr>".format(cor_m, r['margem_%']))
+    parts.append("</table>")
+    parts.append("<div style='margin-top:8px;font-size:12px;color:#fff;'><b>Sequência:</b><br>{0}</div>".format(r['sequencia']))
+    parts.append("</div>")
+parts.append("</div>")  # fim cards
+parts.append("</div>")  # fim dashboard
+
+html_final = "".join(parts)
+
+# CSV
+df_relatorio = pd.DataFrame(relatorio)
+df_relatorio['ocupacao_%'] = (df_relatorio['carga']/df_relatorio['limite']*100).round(2)
+df_relatorio.to_csv('relatorio_hermes_flow.csv', index=False)
+print("\n📄 Relatório salvo em: relatorio_hermes_flow.csv")
+display(df_relatorio)
+
+display(HTML(html_final))
+display(mapa)
+
+# ---------------- 6. RESUMO EXECUTIVO ----------------
+print("="*70)
+print("📋 RESUMO EXECUTIVO — APOIO À DECISÃO")
+print("="*70)
+print(f"• Custo otimizado:         R$ {custo_total:.2f}")
+print(f"• Receita estimada:        R$ {receita_total:.2f}")
+print(f"• Lucro bruto:             R$ {lucro_total:.2f}")
+print(f"• Margem de lucro:         {margem_pct:.2f}%  (meta {META_MARGEM:.1f}%)")
+print(f"• Avaliação:               {status_meta}")
+print("-"*70)
+print(f"• IC95 custo (MC):         [R$ {np.percentile(custos_sim,2.5):.2f}, R$ {np.percentile(custos_sim,97.5):.2f}]")
+print(f"• IC95 margem (MC):        [{np.percentile(margens_sim,2.5):.2f}%, {np.percentile(margens_sim,97.5):.2f}%]")
+print(f"• P(margem ≥ {META_MARGEM:.0f}%):        {prob_meta:.1f}%")
+print
