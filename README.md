@@ -1,2 +1,2 @@
 # hermes_flow.py
-projeto de otimização  
+Projeto de Otimização Logística e Pesquisa Operacional para a ExpoTech 2026.
